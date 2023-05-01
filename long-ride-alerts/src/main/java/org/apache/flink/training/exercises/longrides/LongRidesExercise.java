@@ -21,6 +21,8 @@ package org.apache.flink.training.exercises.longrides;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.JobExecutionResult;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -38,77 +40,113 @@ import java.time.Duration;
 /**
  * The "Long Ride Alerts" exercise.
  *
- * <p>The goal for this exercise is to emit the rideIds for taxi rides with a duration of more than
- * two hours. You should assume that TaxiRide events can be lost, but there are no duplicates.
+ * <p>
+ * The goal for this exercise is to emit the rideIds for taxi rides with a
+ * duration of more than two hours. You should assume that TaxiRide events can
+ * be lost, but there are no duplicates.
  *
- * <p>You should eventually clear any state you create.
+ * <p>
+ * You should eventually clear any state you create.
  */
 public class LongRidesExercise {
-    private final SourceFunction<TaxiRide> source;
-    private final SinkFunction<Long> sink;
+	private final SourceFunction<TaxiRide> source;
+	private final SinkFunction<Long> sink;
 
-    /** Creates a job using the source and sink provided. */
-    public LongRidesExercise(SourceFunction<TaxiRide> source, SinkFunction<Long> sink) {
-        this.source = source;
-        this.sink = sink;
-    }
+	/** Creates a job using the source and sink provided. */
+	public LongRidesExercise(SourceFunction<TaxiRide> source, SinkFunction<Long> sink) {
+		this.source = source;
+		this.sink = sink;
+	}
 
-    /**
-     * Creates and executes the long rides pipeline.
-     *
-     * @return {JobExecutionResult}
-     * @throws Exception which occurs during job execution.
-     */
-    public JobExecutionResult execute() throws Exception {
+	/**
+	 * Creates and executes the long rides pipeline.
+	 *
+	 * @return {JobExecutionResult}
+	 * @throws Exception which occurs during job execution.
+	 */
+	public JobExecutionResult execute() throws Exception {
 
-        // set up streaming execution environment
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+		// set up streaming execution environment
+		StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 
-        // start the data generator
-        DataStream<TaxiRide> rides = env.addSource(source);
+		// start the data generator
+		DataStream<TaxiRide> rides = env.addSource(source);
 
-        // the WatermarkStrategy specifies how to extract timestamps and generate watermarks
-        WatermarkStrategy<TaxiRide> watermarkStrategy =
-                WatermarkStrategy.<TaxiRide>forBoundedOutOfOrderness(Duration.ofSeconds(60))
-                        .withTimestampAssigner(
-                                (ride, streamRecordTimestamp) -> ride.getEventTimeMillis());
+		// the WatermarkStrategy specifies how to extract timestamps and generate
+		// watermarks
+		WatermarkStrategy<TaxiRide> watermarkStrategy = WatermarkStrategy
+				.<TaxiRide>forBoundedOutOfOrderness(Duration.ofSeconds(60))
+				.withTimestampAssigner((ride, streamRecordTimestamp) -> ride.getEventTimeMillis());
 
-        // create the pipeline
-        rides.assignTimestampsAndWatermarks(watermarkStrategy)
-                .keyBy(ride -> ride.rideId)
-                .process(new AlertFunction())
-                .addSink(sink);
+		// create the pipeline
+		rides.assignTimestampsAndWatermarks(watermarkStrategy).keyBy(ride -> ride.rideId).process(new AlertFunction())
+				.addSink(sink);
 
-        // execute the pipeline and return the result
-        return env.execute("Long Taxi Rides");
-    }
+		// execute the pipeline and return the result
+		return env.execute("Long Taxi Rides");
+	}
 
-    /**
-     * Main method.
-     *
-     * @throws Exception which occurs during job execution.
-     */
-    public static void main(String[] args) throws Exception {
-        LongRidesExercise job =
-                new LongRidesExercise(new TaxiRideGenerator(), new PrintSinkFunction<>());
+	/**
+	 * Main method.
+	 *
+	 * @throws Exception which occurs during job execution.
+	 */
+	public static void main(String[] args) throws Exception {
+		LongRidesExercise job = new LongRidesExercise(new TaxiRideGenerator(), new PrintSinkFunction<>());
 
-        job.execute();
-    }
+		job.execute();
+	}
 
-    @VisibleForTesting
-    public static class AlertFunction extends KeyedProcessFunction<Long, TaxiRide, Long> {
+	static Long TIMEOUT = (long) (2 * 60 * 60 * 1000); // 2 hours
 
-        @Override
-        public void open(Configuration config) throws Exception {
-            throw new MissingSolutionException();
-        }
+	@VisibleForTesting
+	public static class AlertFunction extends KeyedProcessFunction<Long, TaxiRide, Long> {
+		private ValueState<Long> startedStore;
+		private ValueState<Long> endedStore;
 
-        @Override
-        public void processElement(TaxiRide ride, Context context, Collector<Long> out)
-                throws Exception {}
+		@Override
+		public void open(Configuration config) throws Exception {
+			startedStore = getRuntimeContext().getState(new ValueStateDescriptor<>("startedStore", Long.class));
+			endedStore = getRuntimeContext().getState(new ValueStateDescriptor<>("startedStore", Long.class));
+		}
 
-        @Override
-        public void onTimer(long timestamp, OnTimerContext context, Collector<Long> out)
-                throws Exception {}
-    }
+		@Override
+		public void processElement(TaxiRide ride, Context context, Collector<Long> out) throws Exception {
+			Long started = startedStore.value();
+			Long ended = endedStore.value();
+			if (ride.isStart) {
+				if (ended != null) {
+					if (ended - ride.getEventTimeMillis() > TIMEOUT) {
+						out.collect(ride.rideId);
+					}
+					endedStore.clear();
+				} else {
+					startedStore.update(ride.getEventTimeMillis());
+					context.timerService().registerEventTimeTimer(ride.getEventTimeMillis() + TIMEOUT);
+				}
+			} else {
+				if (started != null) {
+					if (ride.getEventTimeMillis() - started > TIMEOUT) {
+						out.collect(ride.rideId);
+					}
+					startedStore.clear();
+					context.timerService().deleteEventTimeTimer(started + TIMEOUT);
+				} else {
+					endedStore.update(ride.getEventTimeMillis());
+				}
+			}
+		}
+
+		@Override
+		public void onTimer(long timestamp, OnTimerContext context, Collector<Long> out) throws Exception {
+			Long started = startedStore.value();
+			if (context.getCurrentKey() == 1) {
+				started = startedStore.value();
+			}
+			if (started != null && (timestamp - started) >= TIMEOUT) {
+				out.collect(context.getCurrentKey());
+			}
+			startedStore.clear();
+		}
+	}
 }
